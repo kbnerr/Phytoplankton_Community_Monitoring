@@ -1,0 +1,867 @@
+---
+title: "Phyto Data Visualization and Exploration"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: journal
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: hide
+---
+
+# Assessing the Yearround Data
+
+These graphs and analyses include data from Homer (harbor and SWMP station), Seldovia Bay (mostly harbor and SWMP station), Kasitsna Bay, Jakolof Bay, and Eldred Passage. These are the water bodies close-ish to SWMP stations that have a substantial amount of data. I've grouped plots mostly by sub-bay/water body or north vs south side of the bay, although one of the plots below shows number of samples for each specific site code.
+
+## Where and when do we have samples?
+
+In my initial data wrangling, I create new variables for month, year, and day of year, combine "duplicate" data (multiple samples in one day) and create an effort column to account for it, combine all Chaetoceros into one species, remove 2010-2012 data, and filter out 11 entries with blank abundances. Here are how many samples we have at each site, water body, and combined for the north and south side:
+```{r message = FALSE, warning = FALSE, fig.height = 10, fig.width = 13}
+# Load Packages
+library(tidyverse)
+library(vegan)
+library(viridis)
+library(goeveg)
+library(plotly)
+library(knitr)
+library(factoextra)
+theme_set(theme_bw())
+
+# Read in data; code below to check parameters if needed
+hs = read.csv("PhytoData_Hom_Sel_Expanded.csv")
+# glimpse(hs)
+# unique(hs$Species)
+# unique(hs$Abundance)
+# unique(hs$Site.ID)
+# unique(hs$Group)
+
+# Convert dates to date class
+hs$Date = mdy(hs$SampleDate)
+# class(hs$Date)
+
+# Create month, year, day of year variables
+hs$Month = fct_recode(as.factor(month(hs$Date)), Jan = "1", Feb = "2", Mar = "3", Apr = "4", May = "5", Jun = "6", Jul = "7", Aug = "8", Sep = "9", Oct = "10", Nov = "11", Dec = "12")
+hs$Year = as.factor(year(hs$Date))
+hs$Day.of.Yr = yday(hs$Date)
+
+# Convert abundance categories to 1-3 scale (add 0s later for absent species)
+hs$num.abund = rep(NA, nrow(hs))
+hs$num.abund[hs$Abundance == "P"] = 1
+hs$num.abund[hs$Abundance == "A"] = 2
+hs$num.abund[hs$Abundance == "B"] = 3
+
+# Create presence-absence column (all present for now)
+hs$PA = rep(1, nrow(hs))
+
+# Drop certain sites: after looking at how many samples we have, it's clear that 'Homer Spit West', Little Tutka, Little Jakolof, and North Hesketh just don't have enough samples to evaluate differences from other sites. Nick Dudiak Lagoon was intensively sampled May-July 2012 (20-30 samples per month), with some other sampling 2010-2018, so any differences in phytoplankton community from the Homer harbor/SWMP sites would skew the early data.
+hs = hs %>% filter(!(Site.ID %in% c("HSW","NDL","LJB","LJC","LTH","LTM","NHI"))) %>%
+  filter(!(Year %in% c("2010","2011","2012")))  # Per Rosie, sample identification was less detailed prior to 2013
+
+hs = hs %>% drop_na(num.abund) # Dropped 11 observations with blank Abundance value
+
+# Create N/S, Bay variables
+hs$NS = fct_collapse(hs$Site.ID, 
+                     N = c("HMH","HMS"),
+                     S = c("SVB","SVS","SVH","SVM","KBE","KBL","JBB","JBD","JBR","EPE","EPW","EPY"))
+
+hs$Bay = fct_collapse(hs$Site.ID,
+                      HOM = c("HMH","HMS"),
+                      SEL = c("SVB","SVS","SVH","SVM"),
+                      KAS = c("KBE","KBL"),
+                      JAK = c("JBB","JBD","JBR"),
+                      EP = c("EPE","EPW","EPY"))
+
+test = hs %>% group_by(Date, Site.ID, Species) %>% summarise(n = n()) # There is 1 date/site triplicate (Seldovia SWMP 6/9/14) and there are 32 duplicates. At least 4 pairs have inconsistent abundance values. Probably all from multiple samples in one day.
+test = test %>% group_by(Date, Site.ID) %>% summarise(effort = max(n))
+
+# Collapse Chaetoceros into one "species", make abundance the max chaetoceros abundance in the sample
+hs = hs %>% mutate(Species = fct_collapse(hs$Species, "Chaetoceros spp." = c("Chaetoceros spp.","Chaetoceros socialis","Chaetoceros debilis","Chaetoceros concavicornis","Chaetoceros laciniosus"))) %>% group_by(Species, Group, Site.ID, NS, Bay, Date, Month, Year, Day.of.Yr, PA) %>%
+  summarise(num.abund = max(num.abund)) %>%
+  ungroup()
+
+hs = hs %>% inner_join(test, by = c("Date","Site.ID")) %>%
+  group_by(Species, Site.ID, NS, Bay, Group, Date, Month, Year, Day.of.Yr, PA, effort) %>% 
+  summarise(num.abund = sum(num.abund),
+            mean.abund = num.abund/effort) %>% 
+  ungroup() # Sum and average abundances for duplicates.
+
+# Create wide version for later analysis (using averages in the species table)
+hs.wide = hs %>% select(-c(Group, mean.abund, num.abund)) %>% 
+  pivot_wider(names_from = Species, values_from = PA, values_fill = 0)
+
+# Filter full data to Apr-Sept, add "season" variable to test
+hs.summer = hs %>% filter(Month %in% c("Apr","May","Jun","Jul","Aug","Sep"))
+hs.wide.summer = hs.wide %>% filter(Month %in% c("Apr","May","Jun","Jul","Aug","Sep"))
+
+# write.csv(hs.summer, file = "Phyto4to9_HomSelKasJakEld_Long.csv")
+# write.csv(hs.wide.summer, file = "Phyto4to9_HomSelKasJakEld_WidePA.csv")
+# write.csv(hs, file = "Phyto_HomSelKasJakEld_Long.csv")
+# write.csv(hs.wide, file = "Phyto_HomSelKasJakEld_WidePA.csv")
+
+# Calculate species richness by sample, then number of samples by month/year
+hs.sp.rich = hs %>% group_by(Year, Month, Date, effort, Day.of.Yr, Bay, NS, Site.ID) %>% summarise(species = n())
+hs.by.mon = hs.sp.rich %>% group_by(Year, Month, Site.ID) %>% summarise(samples = sum(effort))
+
+hs.sp.rich.b = hs %>% group_by(Year, Month, Date, effort, Day.of.Yr, Bay) %>% summarise(species = n())
+hs.by.mon.b = hs.sp.rich.b %>% group_by(Year, Month, Bay) %>% summarise(samples = sum(effort))
+
+hs.sp.rich.ns = hs %>% group_by(Year, Month, Date, effort, Day.of.Yr, NS) %>% summarise(species = n())
+hs.by.mon.ns = hs.sp.rich.ns %>% group_by(Year, Month, NS) %>% summarise(samples = sum(effort))
+
+# Plot number of samples by month/year
+ggplot(hs.by.mon) + 
+  geom_tile(aes(x = Month, y = Year, fill = samples)) +
+  scale_fill_viridis_c() +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = "gray90")) +
+  facet_wrap(~Site.ID)
+```
+
+```{r fig.width = 12}
+ggplot(hs.by.mon.b) + 
+  geom_tile(aes(x = Month, y = Year, fill = samples)) +
+  scale_fill_viridis_c() +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = "gray90")) +
+  facet_wrap(~Bay)
+
+ggplot(hs.by.mon.ns) + 
+  geom_tile(aes(x = Month, y = Year, fill = samples)) +
+  scale_fill_viridis_c() +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = "gray90")) +
+  facet_wrap(~NS)
+```
+
+Seldovia harbor was sampled less consistently than Homer harbor, but after adding in other south side water bodies there's pretty consistent coverage on both sides of the bay.
+<Br>
+</Br>
+
+## Species Richness by Year and Time of Year
+
+```{r fig.width = 8, fig.height = 10}
+# Plot richness by year and day of year
+ggplot(hs.sp.rich) + 
+  geom_point(aes(x = Day.of.Yr, y = Year, size = species, color = species)) +
+  scale_color_viridis_c() +
+  facet_wrap(~NS, ncol = 1)
+
+ggplot(hs.sp.rich) + 
+  geom_point(aes(x = Day.of.Yr, y = Year, size = species, color = species)) +
+  scale_color_viridis_c() +
+  facet_wrap(~Bay, ncol = 1)
+```
+
+Species richness was lower in earlier years and has been especially high recently in Kasitsna and Jakolof.
+<Br>
+</Br>
+
+## How common is each species?
+
+```{r fig.width = 10, fig.height = 10}
+# Order species by abundance
+hs$Species = fct_reorder(.f = hs$Species, .x = hs$num.abund, .fun = sum, .desc = TRUE)
+
+# Create bar plots of number present, abundant, blooming for each species in each species group
+ggplot(hs %>% filter(Group == "Dinoflagellate")) + 
+  geom_histogram(aes(x = num.abund, fill = NS), bins = 3) +
+  scale_x_continuous(breaks = c(1,2,3), expand = c(0,0)) +
+  facet_wrap(~Species, ncol = 4) +
+  labs(title = "Dinoflagellates", x = "Abundance (1 = Present, 2 = Abundant, 3 = Bloom)", fill = "North vs South")
+```
+
+```{r fig.width = 10, fig.height = 15}
+ggplot(hs %>% filter(Group == "Diatom")) + 
+  geom_histogram(aes(x = num.abund, fill = NS), bins = 3) +
+  scale_x_continuous(breaks = c(1,2,3), expand = c(0,0)) +
+  facet_wrap(~Species, ncol = 4) +
+  labs(title = "Diatoms", x = "Abundance (1 = Present, 2 = Abundant, 3 = Bloom)", fill = "North vs South")
+```
+
+```{r}
+ggplot(hs %>% filter(Group == "Silicoflagellate")) + 
+  geom_histogram(aes(x = num.abund, fill = NS), bins = 3) +
+  scale_x_continuous(breaks = c(1,2,3), expand = c(0,0)) +
+  facet_wrap(~Species) +
+  labs(title = "Silicoflagellates", x = "Abundance (1 = Present, 2 = Abundant, 3 = Bloom)", fill = "North vs South")
+```
+
+There are a lot of common species/genera, but it looks like Chaetoceros is the most likely to be abundant or blooming by far.
+<Br>
+</Br>
+
+## How are species distributed...
+
+### By Site
+
+```{r message = FALSE}
+hs.by.bay = hs %>%
+  mutate(Species = fct_lump_n(hs$Species, 7)) %>%
+  group_by(Bay, Species) %>% 
+  summarise(Prevalence = sum(PA))
+
+hs.by.ns = hs %>%
+  mutate(Species = fct_lump_n(hs$Species, 7)) %>%
+  group_by(NS, Species) %>% 
+  summarise(Prevalence = sum(PA))
+
+ggplot(hs.by.bay) +
+  geom_col(aes(x = Bay, y = Prevalence, fill = Species), position = "fill") +
+  scale_fill_manual(values = c('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#000000'))
+
+ggplot(hs.by.ns) +
+  geom_col(aes(x = NS, y = Prevalence, fill = Species), position = "fill") +
+  scale_fill_manual(values = c('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#000000'))
+```
+
+All of these stacked barplots use presence-absence data only. Species distribution seems to be pretty similar with respect to water body and side of the bay.
+
+### By Month
+
+```{r fig.width = 12, message = FALSE}
+hs.by.month = hs.by.mon.b %>% 
+  group_by(Bay, Month) %>%
+  summarise(samples = sum(samples))
+
+hs.by.sp.month = hs %>%
+  inner_join(hs.by.month, by = c("Month", "Bay")) %>%
+  mutate(Species = fct_lump_n(hs$Species, 7)) %>%
+  group_by(Bay, Month, Species) %>%
+  summarise(Prevalence = sum(PA),
+            Prevalence_Norm = Prevalence/mean(samples))
+
+ggplot(hs.by.sp.month) +
+  geom_col(aes(x = Month, y = Prevalence, fill = Species), position = "fill") +
+  scale_fill_manual(values = c('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#000000')) +
+  facet_wrap(~Bay) +
+  labs(title = "Proportional Prevalence")
+
+ggplot(hs.by.sp.month) +
+  geom_col(aes(x = Month, y = Prevalence_Norm, fill = Species), position = "stack") +
+  scale_fill_manual(values = c('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#000000')) +
+  facet_wrap(~Bay) +
+  labs(title = "Total Prevalence (normalized to number of samples in month)")
+```
+
+Unsurprisingly, prevalence - especially of less common species - seems to be higher in the summer months.
+
+### By Year
+
+```{r fig.height = 10, fig.width = 14, message = FALSE}
+hs.by.yr = hs.sp.rich %>% 
+  group_by(Bay, Year) %>%
+  summarise(samples = sum(effort))
+
+hs.by.sp.yr = hs %>%
+  inner_join(hs.by.yr, by = c("Year", "Bay")) %>%
+  mutate(Species = fct_lump_n(hs$Species, 7)) %>%
+  group_by(Bay, Year, Species) %>%
+  summarise(Prevalence = sum(PA),
+            Prevalence_Norm = Prevalence/mean(samples))
+
+ggplot(hs.by.sp.yr) +
+  geom_col(aes(x = Year, y = Prevalence, fill = Species), position = "fill") +
+  scale_fill_manual(values = c('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#000000')) +
+  facet_wrap(~Bay, ncol = 2) +
+  labs(title = "Proportional Prevalence")
+
+ggplot(hs.by.sp.yr) +
+  geom_col(aes(x = Year, y = Prevalence_Norm, fill = Species), position = "stack") +
+  scale_fill_manual(values = c('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#000000')) +
+  facet_wrap(~Bay, ncol = 2) +
+  labs(title = "Total Prevalence (normalized to number of samples in year)")
+```
+
+The species mix has stayed relatively similar across years.
+<Br>
+</Br>
+
+# Exploring the spring through fall data (Apr-Sept)
+
+From this point on, all graphs and analyses only consider the April through September data.
+
+## Plot Average Species Abundance by Year
+
+```{r fig.width = 8, fig.height = 10, message = FALSE}
+
+# Take averages by 1) Month, Year, Bay and 2) Month, Year, North-South
+# ymb.avg = hs.wide.summer %>% group_by(Month, Season, Year, Bay, NS) %>% summarise(across(5:67, mean))
+yns.avg = hs.summer %>% 
+  select(-c(PA, num.abund)) %>%
+  pivot_wider(names_from = Species, values_from = mean.abund, values_fill = 0) %>%
+  group_by(Year) %>% 
+  summarise(across(9:71, mean))
+# s.ymb.avg = ymb.avg %>% filter(NS == "S")  # Just south side bays
+
+# Plot species mean abundance by year
+ggplot(yns.avg %>% pivot_longer(2:64, names_to = "Species", values_to = "Mean.Abundance")) +
+  geom_tile(aes(x = Year, y = reorder(Species, Mean.Abundance, desc = TRUE), fill = Mean.Abundance)) +
+  scale_fill_viridis_c(option = "cividis") +
+  labs(x = "Year", y = "Species", fill = "Mean Abundance")
+```
+
+Chaetoceros is clearly the most abundant genus/species. Overall species diversity seems to have increased over time.
+<Br>
+</Br>
+
+## Assessing Dispersion
+
+I used Bray-Curtis dissimilarities for dispersion, nMDS, PERMANOVA, and clustering. For each analysis, I used presence-absence data only. Jaccard dissimilarities yielded similar results to Bray-Curtis for dispersion.
+
+### By Water Body
+
+```{r}
+# Create matrices for analysis
+mat.ns = as.matrix(hs.wide.summer[9:71]) 
+
+ns.dist = vegdist(mat.ns, method = "bray")
+ns.dist2 = vegdist(mat.ns, method = "jaccard") # tried for dispersion - similar results - but not used further in this document
+
+dispersion = betadisper(ns.dist, hs.wide.summer$Bay)
+anova(dispersion)
+plot(dispersion)
+```
+
+There does seem to be a significant difference in dispersion by water body.
+
+### By North-South
+```{r}
+dispersion = betadisper(ns.dist, hs.wide.summer$NS)
+anova(dispersion)
+plot(dispersion)
+```
+
+There is also a small, but significant difference in dispersion by North vs South.
+
+### By Month
+
+```{r}
+dispersion = betadisper(ns.dist, hs.wide.summer$Month)
+anova(dispersion)
+plot(dispersion)
+```
+
+Dispersion seems to be about the same by month.
+
+### By Year
+
+```{r}
+dispersion = betadisper(ns.dist, hs.wide.summer$Year)
+anova(dispersion)
+plot(dispersion)
+```
+
+There is a clear difference in dispersion by year.
+<Br>
+</Br>
+
+## PERMANOVAs
+
+### North vs. South
+
+```{r}
+perm.summer = adonis2(mat.ns ~ Month*Year + NS, by = "terms", data = hs.wide.summer, perm = 99, method = "bray") # took 8 min to run with 999 perms
+perm.summer
+
+perm.summer2 = adonis2(mat.ns ~ NS + Month*Year, by = "terms", data = hs.wide.summer, perm = 99, method = "bray") # took 11 min to run with 999 perms
+perm.summer2
+# Basically identical results when terms are switched; I also tried running this "by margin", and the results were virtually identical
+```
+
+North vs South explains very little difference (0.6-0.9%), though it is a significant variable. Year, Month, and Year-Month Interaction explain much more variance.
+
+### By Water Body, including North and South
+
+```{r}
+perm.summer3 = adonis2(mat.ns ~ Month*Year + Bay, by = "terms", data = hs.wide.summer, perm = 99, method = "bray")
+perm.summer3
+```
+
+Using water body instead of North-South increases the explanatory power slightly (R2 = 3%). These results suggest that Homer and the south side of the bay will need to be considered separately in relation to SWMP data.
+
+### Pairwise differences, controlling for other variables:
+
+#### Water Bodies:
+
+```{r}
+bays = unique(hs.wide.summer$Bay)
+comb = combn(bays, 2)
+
+data = list()
+
+for (site in 1:ncol(comb)){
+  filt = hs.wide.summer %>% filter(Bay %in% comb[,site])
+  mat = as.matrix(filt[,9:71])
+  mod = adonis2(mat ~ Month*Year + Bay, by = "terms", data = filt, perm = 99, method = "bray")
+  data[[site]] = data.frame(Pair = paste(comb[1,site], comb[2,site]),
+                            R2 = round(mod[3,3],3),
+                            Fval = round(mod[3,4],2),
+                            adj.P = round(p.adjust(pf(mod[3,4], 1, 392, lower.tail = FALSE), method = "hochberg", n = ncol(comb)),3))
+  # Use F distribution to calculate P: number of permutations limits how low the adonis2 output p-value can go, limiting the ability to do a family-wise upward adjustment
+}
+
+data.df = bind_rows(data)
+kable(data.df %>% arrange(desc(R2)))
+```
+
+#### Months
+
+```{r}
+mn = unique(hs.wide.summer$Month)
+comb2 = combn(mn, 2)
+
+data2 = list()
+
+for (i in 1:ncol(comb2)){
+  filt = hs.wide.summer %>% filter(Month %in% comb2[,i])
+  mat = as.matrix(filt[,9:71])
+  mod = adonis2(mat ~ NS + Year*Month, by = "terms", data = filt, perm = 99, method = "bray")
+  data2[[i]] = data.frame(Pair = paste(comb2[1,i], comb2[2,i]),
+                            R2 = round(mod[3,3],3),
+                            Fval = round(mod[3,4],2),
+                            adj.P = round(p.adjust(pf(mod[3,4], 1, mod[5,1], lower.tail = FALSE), method = "hochberg", n = ncol(comb2)),3))
+}
+
+data.df.2 = bind_rows(data2)
+kable(data.df.2 %>% arrange(desc(R2)))
+```
+
+
+#### Years
+
+```{r}
+yr = unique(hs.wide.summer$Year)
+comb3 = combn(yr, 2)
+
+data3 = list()
+
+for (i in 1:ncol(comb3)){
+  filt = hs.wide.summer %>% filter(Year %in% comb3[,i])
+  mat = as.matrix(filt[,9:71])
+  mod = adonis2(mat ~ NS + Month*Year, by = "terms", data = filt, perm = 99, method = "bray")
+  data3[[i]] = data.frame(Pair = paste(comb3[1,i], comb3[2,i]),
+                            R2 = round(mod[3,3],3),
+                            Fval = round(mod[3,4],2),
+                            adj.P = round(p.adjust(pf(mod[3,4], 1, mod[5,1], lower.tail = FALSE), method = "hochberg", n = ncol(comb3)),3))
+}
+
+data.df.3 = bind_rows(data3)
+kable(data.df.3 %>% arrange(desc(R2)), scroll_y = TRUE)
+```
+
+
+Most pairs of months, years, and even water bodies show significant differences.
+<Br>
+</Br>
+
+## nMDS with Phyto Samples
+
+### All species? How many dimensions?
+
+Here is a screeplot using all species:
+
+```{r}
+# Screeplot using all species - use Bray-Curtis distances
+set.seed(3287)
+screeplot = dimcheckMDS(mat.ns, distance = "bray", trymax = 5, k = 4) +  abline(h = 0.10, col = "blue", lty = 2 ) +
+      abline(h = 0.05, col = "green", lty = 2)
+# 0.261 with 1 dimension, 0.253 with 2, 0.207 with 3, 0.169 with 4
+```
+
+Here, I take out rare species (< 100 presences), which narrows the data down to 31 species (from 63 originally):
+
+```{r}
+# Try taking out rare species:
+sums = data.frame(sum = apply(mat.ns, 2, sum))
+arrange(sums, sum)
+
+mat.common = as.data.frame(mat.ns) %>% select(where(function(x) sum(x) > 100))
+# Reduced from 63 to 31 species.
+zero_rows = which(apply(mat.common, 1, sum) == 0)
+# zero_rows # 1 row of zeros introduced
+mat.common = as.matrix(mat.common[-208,])
+hs.wide.summer.c = hs.wide.summer[-208,]
+
+# write.csv(cbind(hs.wide.summer.c[,1:8], as.data.frame(mat.common)), "Phyto4to9_HomSelKasJakEld_WidePA_CommonSpp.csv")
+
+set.seed(1009) # make reproducible
+screeplot = dimcheckMDS(mat.common, distance = "bray", trymax = 5, k = 4) +  abline(h = 0.10, col = "blue", lty = 2 ) + 
+      abline(h = 0.05, col = "green", lty = 2)
+# Stress about the same... 0.418 with 1 dimension, 0.270 with 2, 0.208 with 3, 0.170 with 4
+```
+
+Removing rare species doesn't actually improve the stress, but I decided to do so anyway since rare species might have been identified less consistently over time.
+<Br>
+</Br>
+
+### Run nMDS with k = 3, only common species
+
+```{r results = FALSE}
+set.seed(5762)  # make it reproducible
+nMDS.ns = metaMDS(mat.common, trymax = 25, k = 3, distance = "bray")  # with this seed, a no solution converges within 500 tries; set trymax to 25 for knitted markdown to reduce runtime
+nMDS.ns$stress # 0.2079
+
+stressplot(nMDS.ns, sub = 'Shepards plot for phyto data with 3 dimensions.')
+```
+
+### Regress variables onto nMDS
+
+```{r}
+# Put the nmds data into a table for plotting
+nmds.data = data.frame(Year = hs.wide.summer.c$Year,  # make data frame with all the info for graphing
+                       Year.Continuous = as.numeric(as.character(hs.wide.summer.c$Year)),  # Year as continuous
+                       Month = hs.wide.summer.c$Month, 
+                       Bay = hs.wide.summer.c$Bay,
+                       NS = hs.wide.summer.c$NS,
+                       Day.of.Yr = hs.wide.summer.c$Day.of.Yr,
+                       nmds1 = nMDS.ns$points[,1], 
+                       nmds2 = nMDS.ns$points[,2], 
+                       nmds3 = nMDS.ns$points[,3])
+
+# Regress factor data (site, month, year) onto nMDS
+env = nmds.data[,c("NS","Bay","Month","Year","Day.of.Yr","Year.Continuous")]  # make data frame of factors to test
+envfit.hs = envfit(nmds.data[,c("nmds1","nmds2","nmds3")], env, choices = c(1:4))  # run regression
+envfit.hs
+```
+
+I tried regressing year as both a factor variable and a continuous variable. Both day of year and continuous year show strong correlations with the ordination data. The factor variables show similar relationships to what we see in the PERMANOVAs (as they should).
+<Br>
+</Br>
+
+### Plot nMDS in 2-D:
+
+#### North vs South Side of the Bay
+
+Here is nMDS plotted by north-south (including centroids and ellipses), with centroids for 12 common species and continuous correlation vectors also shown. There are 3 graphs showing each combination of 2 axes. We may not want to include all of these things in our final product(s) - for example, the species are messy even when I only show partial names, and you can't distinguish between Thalassiosira and Thalassionema with only the first 5 letters.
+```{r}
+# Create table of species centroids for plotting
+species.centroids = data.frame(Species = rownames(nMDS.ns$species), # make data frame for species centroids
+                               nmds1 = nMDS.ns$species[,1], 
+                               nmds2 = nMDS.ns$species[,2], 
+                               nmds3 = nMDS.ns$species[,3])
+common.spp.centroids = species.centroids %>%
+  filter(Species %in% c("Chaetoceros spp.","Pseudo-nitzschia spp.","Thalassiosira spp.","Leptocylindrus spp.","Thalassionema spp.","Protoperidinium spp.","Coscinodiscus spp.","Navicula morphotype","Pleurosigma morphotype","Rhizosolenia spp.","Skeletonema spp.","Dictyocha spp. (Chromophyte)"))
+
+# Create table of North-South centroids
+ns.cent = as.data.frame(envfit.hs$factors[[1]][1:2,1:3])
+ns.cent$NS = rownames(ns.cent)
+# Create table of Bay/Water Body Centroids
+bay.cent = as.data.frame(envfit.hs$factors[[1]][3:7,1:3])
+bay.cent$bay = rownames(bay.cent)
+# Create table of month centroids
+m.cent = as.data.frame(envfit.hs$factors[[1]][8:13,1:3])
+m.cent$month = rownames(m.cent)
+# Create table of year centroids
+y.cent = as.data.frame(envfit.hs$factors[[1]][14:25,1:3])
+y.cent$year = rownames(y.cent)
+# Create table of vectors (year and day of year)
+vec = as.data.frame(envfit.hs$vectors[[1]])
+
+
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = NS)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds1, y = nmds2, label = substr(Species,1,5)), size = 3) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = NS)) +
+  geom_point(data = ns.cent, aes(x = nmds1, y = nmds2), color = "black") +
+  geom_text(data = ns.cent, aes(x = nmds1, y = nmds2, label = substr(NS,3,3)), size = 3, nudge_y = -.05) +
+  geom_segment(data = vec, aes(x = 0, xend = nmds1, y = 0, yend = nmds2), color = "gray40") +
+  geom_text(data = vec, aes(x = nmds1, y = nmds2, label = rownames(vec)), color = "black", size = 3) +
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = NS)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds1, y = nmds3, label = substr(Species,1,5)), size = 3) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = NS)) +
+  geom_point(data = ns.cent, aes(x = nmds1, y = nmds3), color = "black") +
+  geom_text(data = ns.cent, aes(x = nmds1, y = nmds3, label = substr(NS,3,3)), size = 3, nudge_y = -.05) +
+  geom_segment(data = vec, aes(x = 0, xend = nmds1, y = 0, yend = nmds3), color = "gray40") +
+  geom_text(data = vec, aes(x = nmds1, y = nmds3, label = rownames(vec)), color = "black", size = 3) +
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = NS)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds2, y = nmds3, label = substr(Species,1,5)), size = 3) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = NS)) +
+  geom_point(data = ns.cent, aes(x = nmds2, y = nmds3), color = "black") +
+  geom_text(data = ns.cent, aes(x = nmds2, y = nmds3, label = substr(NS,3,3)), size = 3, nudge_x = -.03) +
+  geom_segment(data = vec, aes(x = 0, xend = nmds2, y = 0, yend = nmds3), color = "gray40") +
+  geom_text(data = vec, aes(x = nmds2, y = nmds3, label = rownames(vec)), color = "black", size = 3) +
+  coord_fixed(ratio = 1)
+```
+
+There's hardly any discernable difference between the north and south communities. It anything, dispersion is a little higher for north.
+
+#### Differences between Water Bodies
+
+```{r}
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = Bay, shape = Month)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = Bay)) +
+  geom_text(data = bay.cent, aes(x = nmds1, y = nmds2, label = substr(rownames(bay.cent),4,6)), size = 3) +
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = Bay, shape = Month)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = Bay))+
+  geom_text(data = bay.cent, aes(x = nmds1, y = nmds3, label = substr(rownames(bay.cent),4,6)), size = 3) +
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = Bay, shape = Month)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = Bay))+
+    geom_text(data = bay.cent, aes(x = nmds2, y = nmds3, label = substr(rownames(bay.cent),4,6)), size = 3) +
+  coord_fixed(ratio = 1)
+```
+
+There's a little more discernable difference in the ordination between specific water bodies within the bay, though again the differences have more to do with dispersion than centroids.
+
+#### Do North-South differences show up for individual years?
+
+Here is the ordination faceted by year:
+```{r}
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = NS)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = NS)) +
+  facet_wrap(~Year)+
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = NS)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = NS)) +
+  facet_wrap(~Year)+
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = NS)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = NS)) +
+  facet_wrap(~Year)+
+  coord_fixed(ratio = 1)
+```
+
+You still don't really see separation between the north and south ellipses, though there are major dispersion differences in some years.
+
+#### Do North-South differences show up for individual months?
+
+Here is the ordination faceted by month:
+```{r}
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = NS)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = NS)) +
+  facet_wrap(~Month) +
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = NS)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = NS)) +
+  facet_wrap(~Month)+
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = NS)) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = NS)) +
+  facet_wrap(~Month)+
+  coord_fixed(ratio = 1)
+```
+
+Again, no new north-south differences show up when you look at individual months.
+
+#### Overall Changes across Years
+
+Here, I've plotted the ordination with year as a continuous color variable, you can see a pretty clear gradient showing the direction of community shift:
+```{r}
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = as.numeric(as.character(Year)))) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds1, y = nmds2, label = substr(Species,1,5)), size = 3, color = "red3") +
+  scale_color_viridis_c() +
+  geom_segment(data = vec[2,], aes(x = 0, xend = nmds1, y = 0, yend = nmds2), color = "gray40") +
+  geom_text(data = vec[2,], aes(x = nmds1, y = nmds2, label = rownames(vec[2,])), color = "black", size = 3) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Year")
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = as.numeric(as.character(Year)))) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds1, y = nmds3, label = substr(Species,1,5)), size = 3, color = "red3") +
+  scale_color_viridis_c() +
+  geom_segment(data = vec[2,], aes(x = 0, xend = nmds1, y = 0, yend = nmds3), color = "gray40") +
+  geom_text(data = vec[2,], aes(x = nmds1, y = nmds3, label = rownames(vec[2,])), color = "black", size = 3) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Year")
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = as.numeric(as.character(Year)))) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds2, y = nmds3, label = substr(Species,1,5)), size = 3, color = "red3") +
+  scale_color_viridis_c() +
+  geom_segment(data = vec[2,], aes(x = 0, xend = nmds2, y = 0, yend = nmds3), color = "gray40") +
+  geom_text(data = vec[2,], aes(x = nmds2, y = nmds3, label = rownames(vec[2,])), color = "black", size = 3) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Year")
+```
+
+#### Overall Seasonal Differences
+
+Similarly, you can see a continuous gradient when you plot by day of year:
+```{r}
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = Day.of.Yr)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds1, y = nmds2, label = substr(Species,1,5)), size = 3, color = "red3") +
+  scale_color_viridis_c() +  
+  geom_segment(data = vec[1,], aes(x = 0, xend = nmds1, y = 0, yend = nmds2), color = "gray40") +
+  geom_text(data = vec[1,], aes(x = nmds1, y = nmds2, label = rownames(vec[1,])), color = "black", size = 3) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Day of Year")
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = Day.of.Yr)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds1, y = nmds3, label = substr(Species,1,5)), size = 3, color = "red3") +
+  scale_color_viridis_c() +
+  geom_segment(data = vec[1,], aes(x = 0, xend = nmds1, y = 0, yend = nmds3), color = "gray40") +
+  geom_text(data = vec[1,], aes(x = nmds1, y = nmds3, label = rownames(vec[1,])), color = "black", size = 3) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Day of Year")
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = Day.of.Yr)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds2, y = nmds3, label = substr(Species,1,5)), size = 3, color = "red3") +
+  scale_color_viridis_c() +
+  geom_segment(data = vec[1,], aes(x = 0, xend = nmds2, y = 0, yend = nmds3), color = "gray40") +
+  geom_text(data = vec[1,], aes(x = nmds2, y = nmds3, label = rownames(vec[1,])), color = "black", size = 3) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Day of Year")
+```
+<Br>
+</Br>
+
+## Cononical Correspondence Analysis (CCA)
+
+I also tried running a CCA - a more continuous variable-friendly model that Lauren suggested. Here, year is a factor:
+```{r}
+# Make model with year (factor), day of year, north-south (factor)
+CCA_phyto <- cca(mat.common ~ 
+                Year + Day.of.Yr + NS,
+                data = hs.wide.summer.c)
+
+vif.cca(CCA_phyto) # No multicollinearity issues
+
+CCA_phyto
+(R2.CCA <- RsquareAdj(CCA_phyto)$r.sq)
+
+plot(CCA_phyto)
+
+anova(CCA_phyto)
+# anova(CCA_phyto, by = "axis")
+```
+
+And here, year is continuous:
+```{r}
+CCA_phyto2 <- cca(mat.common ~ 
+                Year.Continuous + Day.of.Yr + NS,
+                data = nmds.data)
+vif.cca(CCA_phyto2)
+
+CCA_phyto2
+(R2.CCA2 <- RsquareAdj(CCA_phyto2)$r.sq)
+
+plot(CCA_phyto2)
+
+anova(CCA_phyto2)
+#anova(CCA_phyto2, by = "axis")
+```
+
+It seems that including year as a factor is more explanatory than including year as a continuous variable (adjusted R2 = 0.13 vs 0.08).
+<Br>
+</Br>
+
+## Clustering
+
+Finally, I tried hierarchical clustering using Ward's linkages. I tried running some functions Lauren sent for finding the optimal number of clusters, but they disagree on that number; based on the dendrogram, 3 clusters makes a lot of sense. See comments in the code for more details.
+```{r}
+# Use Bray-Curtis distances:
+ns.dist.2 = vegdist(mat.common, method = "bray")
+
+# Optimal clustering functions: these all use kmeans, so not sure if they're fully applicable to hierarchical clustering?
+# fviz_nbclust(mat.common, kmeans, 
+#              method = "silh", diss = ns.dist.2, k.max = 8) # 2 clusters best?
+# fviz_nbclust(mat.common, kmeans, 
+#              method = "wss", diss = ns.dist.2, k.max = 8) # 4 best?
+# fviz_nbclust(mat.common, kmeans, 
+#              method = "gap", diss = ns.dist.2, k.max = 8) # 4 best? Or 8+?
+
+cluster1 <- hclust(ns.dist.2, method = "ward.D2")
+plot(cluster1, labels=F)
+rect.hclust(tree = cluster1, k = 3, border = "blue")
+nmds.data$cluster = as.factor(cutree(cluster1, k = 3))
+hs.wide.summer.c$cluster = nmds.data$cluster
+```
+
+### Plotting clusters on the nMDS ordination
+
+The clusters separate out well on the nMDS ordination (as they should):
+```{r}
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = cluster, shape = NS)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds1, y = nmds2, label = substr(Species,1,5)), size = 3) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds2, color = cluster)) +
+  geom_segment(data = vec, aes(x = 0, xend = nmds1, y = 0, yend = nmds2), color = "gray40") +
+  geom_text(data = vec, aes(x = nmds1, y = nmds2, label = rownames(vec)), color = "black", size = 3) +
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = cluster, shape = NS)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds1, y = nmds3, label = substr(Species,1,5)), size = 3) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds1, y = nmds3, color = cluster)) +
+  geom_segment(data = vec, aes(x = 0, xend = nmds1, y = 0, yend = nmds3), color = "gray40") +
+  geom_text(data = vec, aes(x = nmds1, y = nmds3, label = rownames(vec)), color = "black", size = 3) +
+  coord_fixed(ratio = 1)
+ggplot() +
+  geom_point(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = cluster, shape = NS)) +
+  geom_text(data = common.spp.centroids, mapping = aes(x = nmds2, y = nmds3, label = substr(Species,1,5)), size = 3) +
+  stat_ellipse(data = nmds.data, mapping = aes(x = nmds2, y = nmds3, color = cluster)) +
+  geom_segment(data = vec, aes(x = 0, xend = nmds2, y = 0, yend = nmds3), color = "gray40") +
+  geom_text(data = vec, aes(x = nmds2, y = nmds3, label = rownames(vec)), color = "black", size = 3) +
+  coord_fixed(ratio = 1)
+```
+
+### Which samples are in the clusters?
+
+Cluster 3 mostly includes samples from the earlier years, while Cluster 1 is heavy on spring/early summer and Cluster 2 is heavy on late summer/fall:
+```{r message = FALSE}
+sum.clust1 = nmds.data %>%
+  group_by(cluster, Month, Year) %>%
+  summarise(n = n())
+
+ggplot(sum.clust1) +
+  geom_tile(aes(x = Month, y = Year, fill = n)) +
+  scale_fill_viridis_c() +
+  facet_wrap(~cluster)
+```
+
+```{r}
+sum.clust2 = nmds.data %>%
+  group_by(cluster, Year, Bay) %>%
+  summarise(n = n())
+
+ggplot(sum.clust2) +
+  geom_tile(aes(x = Bay, y = Year, fill = n)) +
+  scale_fill_viridis_c() +
+  facet_wrap(~cluster)
+```
+
+The separation by water body and north vs south is much less clear. Note that the water bodies were unevenly sampled - for example, there were a ton of samples from Jakolof Bay in 2013.
+
+### Species Distributions between Clusters
+
+```{r message = FALSE}
+samp = hs.wide.summer.c %>% group_by(cluster) %>% summarise(n = sum(effort))
+
+hs.clusters = hs.wide.summer.c %>%
+  pivot_longer(9:71, names_to = "species", values_to = "PA") %>% 
+  filter(PA != 0) %>% 
+  inner_join(samp)
+
+hs.clusters$species = fct_lump_n(hs.clusters$species, 7)
+
+hs.clusters = hs.clusters %>% group_by(cluster, species) %>%
+  summarise(Prevalence = sum(PA),
+            Prevalence_Norm = Prevalence/mean(n))
+
+ggplot(hs.clusters) +
+  geom_col(aes(x = as.factor(cluster), y = Prevalence, fill = reorder(species, Prevalence)), position = "fill") +
+  scale_fill_manual(values = c('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7','#000000')) +
+  labs(x = "Cluster", y = "Proportional Prevalence", fill = "Species")
+
+ggplot(hs.clusters) +
+  geom_col(aes(x = as.factor(cluster), y = Prevalence_Norm, fill = reorder(species, Prevalence_Norm)), position = "stack") +
+  scale_fill_manual(values = c('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7','#000000')) +
+  labs(x = "Cluster", y = "Prevalence (Normalized by # of Samples)", fill = "Species")
+```
+
+Clusters 1 and 2 look pretty similar overall - the common species are a *little* less common in Cluster 2. Almost everything is less common in Cluster 3 - particularly the "other species."
+<Br>
+</Br>
